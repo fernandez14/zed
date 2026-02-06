@@ -1216,6 +1216,7 @@ pub struct Workspace {
     pane_history_timestamp: Arc<AtomicUsize>,
     bounds: Bounds<Pixels>,
     pub centered_layout: bool,
+    pub centered_layout_padding: Option<f32>,
     bounds_save_task_queued: Option<Task<()>>,
     on_prompt_for_new_path: Option<PromptForNewPath>,
     on_prompt_for_open_path: Option<PromptForOpenPath>,
@@ -1638,6 +1639,7 @@ impl Workspace {
             // This data will be incorrect, but it will be overwritten by the time it needs to be used.
             bounds: Default::default(),
             centered_layout: false,
+            centered_layout_padding: None,
             bounds_save_task_queued: None,
             on_prompt_for_new_path: None,
             on_prompt_for_open_path: None,
@@ -1762,10 +1764,10 @@ impl Workspace {
             }
 
             let window = if let Some(window) = requesting_window {
-                let centered_layout = serialized_workspace
+                let (centered_layout, centered_layout_padding) = serialized_workspace
                     .as_ref()
-                    .map(|w| w.centered_layout)
-                    .unwrap_or(false);
+                    .map(|w| (w.centered_layout, w.centered_layout_padding))
+                    .unwrap_or((false, None));
 
                 cx.update_window(window.into(), |_, window, cx| {
                     window.replace_root(cx, |window, cx| {
@@ -1778,6 +1780,7 @@ impl Workspace {
                         );
 
                         workspace.centered_layout = centered_layout;
+                        workspace.centered_layout_padding = centered_layout_padding;
 
                         // Call init callback to add items before window renders
                         if let Some(init) = init {
@@ -1810,10 +1813,10 @@ impl Workspace {
                 // Use the serialized workspace to construct the new window
                 let mut options = cx.update(|cx| (app_state.build_window_options)(display, cx));
                 options.window_bounds = window_bounds;
-                let centered_layout = serialized_workspace
+                let (centered_layout, centered_layout_padding) = serialized_workspace
                     .as_ref()
-                    .map(|w| w.centered_layout)
-                    .unwrap_or(false);
+                    .map(|w| (w.centered_layout, w.centered_layout_padding))
+                    .unwrap_or((false, None));
                 cx.open_window(options, {
                     let app_state = app_state.clone();
                     let project_handle = project_handle.clone();
@@ -1827,6 +1830,7 @@ impl Workspace {
                                 cx,
                             );
                             workspace.centered_layout = centered_layout;
+                            workspace.centered_layout_padding = centered_layout_padding;
 
                             // Call init callback to add items before window renders
                             if let Some(init) = init {
@@ -5897,6 +5901,7 @@ impl Workspace {
                     display: Default::default(),
                     docks,
                     centered_layout: self.centered_layout,
+                    centered_layout_padding: self.centered_layout_padding,
                     session_id: self.session_id.clone(),
                     breakpoints,
                     window_id: Some(window.window_handle().window_id().as_u64()),
@@ -6759,6 +6764,36 @@ impl Workspace {
         self.clamp_utility_pane_widths(window, cx);
     }
 
+    pub fn resize_centered_layout(
+        &mut self,
+        side: CenteredLayoutSide,
+        x: Pixels,
+        _window: &mut Window,
+        cx: &mut App,
+    ) {
+        let width = self.bounds.size.width;
+        if width <= px(0.0) {
+            return;
+        }
+
+        let padding = match side {
+            CenteredLayoutSide::Left => x / width,
+            CenteredLayoutSide::Right => (width - x) / width,
+        };
+
+        let settings = WorkspaceSettings::get_global(cx).centered_layout;
+        let max_padding = settings.left_padding.map(|p| p.0).unwrap_or(0.2);
+
+        // Ensure at least 20 pixels from the surrounding container edge
+        let min_padding = px(20.0) / width;
+
+        // Ensure symmetry and respect constraints
+        let padding = padding.clamp(min_padding, max_padding);
+
+        self.centered_layout_padding = Some(padding);
+        cx.notify(self.weak_self.entity_id());
+    }
+
     fn resize_right_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
         let mut size = new_size.max(self.bounds.left() - RESIZE_HANDLE_SIZE);
         self.left_dock.read_with(cx, |left_dock, cx| {
@@ -7137,6 +7172,23 @@ impl Render for DraggedDock {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CenteredLayoutSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone)]
+struct DraggedCenteredLayout {
+    side: CenteredLayoutSide,
+}
+
+impl Render for DraggedCenteredLayout {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         static FIRST_PAINT: AtomicBool = AtomicBool::new(true);
@@ -7181,24 +7233,50 @@ impl Render for Workspace {
         let centered_layout = self.centered_layout
             && self.center.panes().len() == 1
             && self.active_item(cx).is_some();
-        let render_padding = |size| {
-            (size > 0.0).then(|| {
-                div()
-                    .h_full()
-                    .w(relative(size))
-                    .bg(cx.theme().colors().editor_background)
-                    .border_color(cx.theme().colors().pane_group_border)
-            })
-        };
+        let render_padding =
+            |size, side: CenteredLayoutSide, cx: &mut Context<Workspace>| -> Option<Div> {
+                (size > 0.0).then(|| {
+                    div()
+                        .h_full()
+                        .w(relative(size))
+                        .bg(cx.theme().colors().editor_background)
+                        .border_color(cx.theme().colors().pane_group_border)
+                        .relative()
+                        .child(
+                            div()
+                                .id(("centered-layout-resize-handle", side as u32))
+                                .absolute()
+                                .top_0()
+                                .when(side == CenteredLayoutSide::Left, |this| {
+                                    this.right(-RESIZE_HANDLE_SIZE / 2.)
+                                })
+                                .when(side == CenteredLayoutSide::Right, |this| {
+                                    this.left(-RESIZE_HANDLE_SIZE / 2.)
+                                })
+                                .h_full()
+                                .w(RESIZE_HANDLE_SIZE)
+                                .cursor_col_resize()
+                                .on_drag(DraggedCenteredLayout { side }, move |_, _, _, cx| {
+                                    cx.new(|_| DraggedCenteredLayout { side })
+                                })
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .w(px(2.))
+                                        .mx_auto()
+                                        .hover(|this| this.bg(cx.theme().colors().border_variant)),
+                                ),
+                        )
+                })
+            };
         let paddings = if centered_layout {
             let settings = WorkspaceSettings::get_global(cx).centered_layout;
+            let padding = self
+                .centered_layout_padding
+                .unwrap_or_else(|| Self::adjust_padding(settings.left_padding.map(|p| p.0)));
             (
-                render_padding(Self::adjust_padding(
-                    settings.left_padding.map(|padding| padding.0),
-                )),
-                render_padding(Self::adjust_padding(
-                    settings.right_padding.map(|padding| padding.0),
-                )),
+                render_padding(padding, CenteredLayoutSide::Left, cx),
+                render_padding(padding, CenteredLayoutSide::Right, cx),
             )
         } else {
             (None, None)
@@ -7332,6 +7410,20 @@ impl Render for Workspace {
                                                 };
                                                 workspace.serialize_workspace(window, cx);
                                             }
+                                        },
+                                    ))
+                                    .on_drag_move(cx.listener(
+                                        move |workspace,
+                                              e: &DragMoveEvent<DraggedCenteredLayout>,
+                                              window,
+                                              cx| {
+                                            workspace.resize_centered_layout(
+                                                e.drag(cx).side,
+                                                e.event.position.x - workspace.bounds.left(),
+                                                window,
+                                                cx,
+                                            );
+                                            workspace.serialize_workspace(window, cx);
                                         },
                                     ))
                                     .on_drag_move(cx.listener(
@@ -8641,6 +8733,7 @@ async fn open_remote_project_inner(
 
             if let Some(ref serialized) = serialized_workspace {
                 workspace.centered_layout = serialized.centered_layout;
+                workspace.centered_layout_padding = serialized.centered_layout_padding;
             }
 
             workspace
@@ -9240,6 +9333,7 @@ pub struct WorkspacePosition {
     pub window_bounds: Option<WindowBounds>,
     pub display: Option<Uuid>,
     pub centered_layout: bool,
+    pub centered_layout_padding: Option<f32>,
 }
 
 pub fn remote_workspace_position_from_db(
@@ -9274,15 +9368,16 @@ pub fn remote_workspace_position_from_db(
             }
         };
 
-        let centered_layout = serialized_workspace
+        let (centered_layout, centered_layout_padding) = serialized_workspace
             .as_ref()
-            .map(|w| w.centered_layout)
-            .unwrap_or(false);
+            .map(|w| (w.centered_layout, w.centered_layout_padding))
+            .unwrap_or((false, None));
 
         Ok(WorkspacePosition {
             window_bounds,
             display,
             centered_layout,
+            centered_layout_padding,
         })
     })
 }
